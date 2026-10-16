@@ -112,19 +112,30 @@ tests/test_assignments_crud.py::test_invalid_status_is_rejected PASSED
 3. **deploy** — creates a kind cluster on the runner and runs `helm upgrade --install` with the new
    SHA tags, as a smoke test that the chart deploys the images that were just pushed.
 
+First green run: [Actions run #1](https://github.com/dobbydobap/final-devops-project/actions/runs/38944663603)
+(Test → Build, scan and push images → Deploy with Helm, 3m19s). Images:
+[studydesk-backend](https://github.com/users/dobbydobap/packages/container/package/studydesk-backend) and
+[studydesk-frontend](https://github.com/users/dobbydobap/packages/container/package/studydesk-frontend),
+tagged `afaa0b63ef87…` (the commit SHA).
+
 ### Trivy
 
-Trivy scans the OS packages and Python/Node libraries inside each built image. The scans from when
-I first added it are in `docs/screenshots/m6-trivy-before-*.png`, and the result after fixing the
-images is in `m6-trivy-after.png`. A clean result
-means no *fixable* HIGH or CRITICAL vulnerability is known in that image at scan time — not that it
-has no CVEs at all, which is why the scan runs on every build.
+Trivy scans the OS packages and the Python/Node libraries inside each image the pipeline builds,
+before anything is pushed. In run #1 both images came back clean: the backend
+(`python:3.12-slim`, Debian 13, 87 OS packages plus every pip package) and the frontend
+(`nginx` on Alpine 3.24) had **0 HIGH or CRITICAL vulnerabilities** with a fix available. The full
+report from that run is in [`docs/trivy-ci-run-1.txt`](docs/trivy-ci-run-1.txt). Earlier scans
+from when I first added the step are in `docs/screenshots/m6-trivy-before-*.png`.
+
+A clean result means no *fixable* HIGH/CRITICAL issue was known in those images at scan time, not
+that they have no CVEs at all — new ones get published every day, which is why the scan runs on
+every build and the gate (`exit-code: 1`) would stop the push if one appeared.
 
 ## Kubernetes + Helm
 
 ```bash
 kubectl apply -f k8s/namespace.yaml
-helm upgrade --install studydesk helm/studydesk -n studydesk -f helm/studydesk/values-dev.yaml
+helm upgrade --install studydesk helm/studydesk -n studydesk   --set backend.tag=<commit-sha> --set frontend.tag=<commit-sha>
 kubectl get pods,svc,ingress -n studydesk
 helm list -n studydesk
 ```
@@ -132,6 +143,13 @@ helm list -n studydesk
 - backend and frontend each run 2 replicas behind ClusterIP Services
 - the Ingress sends `/` to the frontend and `/api` to the backend
 - an HPA scales the backend on CPU; `scripts/load-test.sh` generates load to watch it scale
+- `values-dev.yaml` drops to 1 replica and no HPA for a laptop; the default values are what I deployed
+
+I ran it on Minikube (Docker driver, ingress addon) with the images from GHCR. On Windows the
+Minikube IP isn't reachable directly, so the Ingress was reached through
+`kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8088:80` with
+`studydesk.local` pointed at it.
+
 - `troubleshooting/` has two deliberately broken manifests (bad image tag, Service selector that
   matches nothing) used to practise `describe` / `logs` / `get endpoints`
 
@@ -143,8 +161,18 @@ helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
   -n monitoring --create-namespace -f monitoring/prometheus-values.yaml
 ```
 
-The chart's ServiceMonitor tells Prometheus to scrape the backend's `/metrics`. Grafana panels use
-`http_requests_total` (request rate by route) and `http_request_duration_seconds` (latency).
+The chart's ServiceMonitor tells Prometheus to scrape the backend's `/metrics` on every backend pod
+(`serviceMonitorSelectorNilUsesHelmValues: false` lets Prometheus pick up ServiceMonitors from
+other releases). The Grafana dashboard is kept as code in
+[`monitoring/studydesk-dashboard.json`](monitoring/studydesk-dashboard.json) — request rate by
+route, p95 latency, responses by status class, backend pods up, and request count — built on
+`http_requests_total` and `http_request_duration_seconds`. Import it from Grafana's
+*Dashboards → New → Import*, or push it with the API:
+
+```bash
+kubectl port-forward -n monitoring svc/monitoring-grafana 3002:80
+jq '{dashboard: ., overwrite: true}' monitoring/studydesk-dashboard.json |   curl -u admin:<password> -H 'Content-Type: application/json' -X POST localhost:3002/api/dashboards/db -d @-
+```
 
 ## Terraform (AWS)
 
@@ -163,6 +191,22 @@ terraform destroy    # run this right after evaluation
 No credentials are stored in the repo; Terraform reads them from `aws configure` or environment
 variables. `terraform.tfvars` and all state files are git-ignored.
 
+**What I've actually run.** I don't have a paid AWS account, and EKS plus a NAT gateway are billed
+by the hour, so I tested the configuration against [Moto](https://github.com/getmoto/moto), a local
+AWS API emulator, using a throwaway provider override (`endpoints { ec2/eks/iam/sts = "http://localhost:5000" }`)
+that is not part of this repo:
+
+- `terraform init`, `fmt -check` and `validate` pass with the real config
+- `terraform plan`: **54 to add, 0 to change, 0 to destroy**
+- `terraform apply` created 51 of the 54 resources, including the VPC, both public and both private
+  subnets, NAT and internet gateways, the EKS cluster (`ACTIVE`, 1.31) and the managed node group.
+  The other two failed only because Moto doesn't implement them (EKS access entries, and it
+  doesn't return the cluster's service CIDR the node-group module checks); real AWS supports both.
+- `terraform destroy` removed everything
+
+The same commands with real credentials create the cluster on AWS; I'll run that for the
+evaluation and destroy it immediately afterwards.
+
 ## Repository layout
 
 ```
@@ -172,18 +216,30 @@ docker-compose.yml
 .github/workflows/ci-cd.yml
 helm/studydesk/ Helm chart (+ dev/prod values)
 k8s/            namespace
-monitoring/     kube-prometheus-stack values
+monitoring/     kube-prometheus-stack values + Grafana dashboard JSON
 terraform/      VPC + EKS
 scripts/        load test for the HPA
 troubleshooting/ broken manifests for debugging practice
 docs/screenshots/
 ```
 
+## Evidence
+
+| Module | Where |
+|---|---|
+| M1 app | [app in the browser](docs/screenshots/m1-app-browser.png), [Swagger](docs/screenshots/m1-swagger-docs.png) |
+| M2 tests | test output above (18 passed) and the *Test* job of Actions run #1 |
+| M3 git | [commit history](docs/screenshots/m3-commit-history.png) |
+| M4 docker | `docker compose up --build` → app on :3000, API on :8000 |
+| M5 CI/CD | [green run](docs/screenshots/m5-actions-run.png), [GHCR backend](docs/screenshots/m5-ghcr-backend.png), [GHCR frontend](docs/screenshots/m5-ghcr-frontend.png) |
+| M6 Trivy | [`docs/trivy-ci-run-1.txt`](docs/trivy-ci-run-1.txt) |
+| M7 Terraform | [init/validate](docs/screenshots/m7-terraform-init-validate.png), [plan](docs/screenshots/m7-terraform-plan.png), [apply (Moto)](docs/screenshots/m7-terraform-apply-moto.png), [VPC + EKS via AWS CLI (Moto)](docs/screenshots/m7-aws-cli-vpc-eks-moto.png), [destroy](docs/screenshots/m7-terraform-destroy.png) |
+| M8 Kubernetes | [pods/svc/ingress/hpa](docs/screenshots/m8-kubectl-get-pods-svc.png), [helm list](docs/screenshots/m8-helm-list.png), [app through the Ingress](docs/screenshots/m8-app-via-ingress.png) |
+| M9 monitoring | [`/metrics`](docs/screenshots/m9-metrics-endpoint.png), [Prometheus targets UP](docs/screenshots/m9-prometheus-targets.png), [Grafana dashboard](docs/screenshots/m9-grafana-dashboard.png) |
+
 ## Status
 
-Done and verified locally: the app, Alembic migration, 18 passing tests, Docker images, compose
-stack, CI workflow, Helm chart and monitoring values.
-
-Still to capture: the green GitHub Actions run and GHCR packages, the Kubernetes/Grafana
-screenshots for StudyDesk, and the Terraform `apply`/`destroy` on AWS — EKS is not free-tier, so I
-am running it only for the evaluation and destroying it straight after.
+Everything above has been run: the app and migration, 18 tests, the compose stack, the CI/CD
+pipeline (green, images on GHCR, Trivy clean), the Helm deployment on Minikube with Ingress and
+HPA, and Prometheus + Grafana scraping the backend. The one piece not yet done on real AWS is the
+Terraform apply/destroy, which so far has only been run against Moto (see the Terraform section).
