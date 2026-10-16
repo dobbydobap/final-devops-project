@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: studydesk
+      POSTGRES_USER: studydesk
+      POSTGRES_PASSWORD: studydesk
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # without this, depends_on only waits for the container to start, not for
+    # postgres to accept connections, and the backend's migration fails
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studydesk -d studydesk"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://studydesk:studydesk@postgres:5432/studydesk
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "3000:8080"
+
+volumes:
+  postgres-data:
