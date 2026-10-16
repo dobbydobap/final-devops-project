@@ -1,0 +1,28 @@
+frontend:
+  image: ghcr.io/dobbydobap/studydesk-frontend
+  tag: latest
+backend:
+  image: ghcr.io/dobbydobap/studydesk-backend
+  tag: latest
+replicaCount: 2
+namespace: studydesk
+imagePullSecrets: []
+postgres:
+  host: studydesk-postgres
+  database: studydesk
+  username: studydesk
+  password: studydesk
+ingress:
+  enabled: true
+  host: studydesk.local
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 60
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: 500m, memory: 512Mi}
+monitoring:
+  serviceMonitor:
+    enabled: true

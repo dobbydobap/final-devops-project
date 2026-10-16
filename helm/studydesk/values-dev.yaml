@@ -1,0 +1,6 @@
+replicaCount: 1
+ingress:
+  enabled: true
+  host: studydesk.local
+hpa:
+  enabled: false

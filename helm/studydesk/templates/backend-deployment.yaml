@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "studydesk.fullname" . }}-backend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {app: studydesk-backend}
+  template:
+    metadata:
+      labels: {app: studydesk-backend}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | indent 8 }}
+      {{- end }}
+      # the backend runs its Alembic migration on startup, so it has to wait for
+      # postgres to accept connections; without this it crash-loops a few times first
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command: ["sh", "-c", "until pg_isready -h {{ .Values.postgres.host }} -p 5432; do echo waiting for postgres; sleep 2; done"]
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image }}:{{ .Values.backend.tag }}"
+          ports: [{containerPort: 8000}]
+          env:
+            - name: DATABASE_URL
+              value: "postgresql+psycopg://{{ .Values.postgres.username }}:{{ .Values.postgres.password }}@{{ .Values.postgres.host }}:5432/{{ .Values.postgres.database }}"
+          readinessProbe:
+            httpGet: {path: /ready, port: 8000}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
