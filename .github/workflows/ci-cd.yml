@@ -1,0 +1,151 @@
+name: StudyDesk CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/studydesk-backend
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/studydesk-frontend
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      # a failing test stops the pipeline here, before any image is built
+      - name: Run backend tests
+        working-directory: backend
+        run: pytest -v
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm install && npm run build
+
+  build-scan-push:
+    name: Build, scan and push images
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images (tagged with the commit SHA)
+        run: |
+          docker build -t "$BACKEND_IMAGE:${{ github.sha }}" ./backend
+          docker build -t "$FRONTEND_IMAGE:${{ github.sha }}" ./frontend
+
+      # security gate: any fixable HIGH or CRITICAL CVE fails the job
+      - name: Trivy scan - backend
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Trivy scan - frontend
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push images
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$BACKEND_IMAGE:${{ github.sha }}"
+          docker push "$FRONTEND_IMAGE:${{ github.sha }}"
+
+  deploy:
+    name: Deploy with Helm
+    needs: build-scan-push
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      # with a KUBE_CONFIG_DATA secret this deploys to that cluster (e.g. EKS);
+      # without one it creates a throwaway kind cluster on the runner so the
+      # deployment is still exercised on every push
+      - name: Use the cluster from KUBE_CONFIG_DATA
+        if: env.KUBE_CONFIG_DATA != ''
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG_DATA" | base64 -d > ~/.kube/config
+
+      - name: Create a kind cluster on the runner
+        if: env.KUBE_CONFIG_DATA == ''
+        uses: helm/kind-action@v1
+
+      - name: Allow the cluster to pull from GHCR
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl create secret docker-registry ghcr-pull -n studydesk \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy with Helm
+        run: |
+          # ServiceMonitor needs the Prometheus Operator CRDs, which only exist where
+          # kube-prometheus-stack is installed, so it is switched off on the throwaway cluster
+          SM=true; [ -z "$KUBE_CONFIG_DATA" ] && SM=false
+          helm upgrade --install studydesk ./helm/studydesk -n studydesk \
+            --set backend.image="$BACKEND_IMAGE" \
+            --set backend.tag=${{ github.sha }} \
+            --set frontend.image="$FRONTEND_IMAGE" \
+            --set frontend.tag=${{ github.sha }} \
+            --set "imagePullSecrets[0].name=ghcr-pull" \
+            --set monitoring.serviceMonitor.enabled=$SM \
+            --wait --timeout 6m
+
+      - name: Show what was deployed
+        if: always()
+        run: |
+          helm list -n studydesk
+          kubectl get deploy,pods,svc,ingress,hpa -n studydesk -o wide
+
+      - name: Smoke test through the frontend
+        run: |
+          kubectl port-forward -n studydesk svc/studydesk-frontend 8080:80 >/dev/null 2>&1 &
+          sleep 5
+          curl -sf http://localhost:8080/ | head -c 300; echo
+          curl -sf http://localhost:8080/health
+          curl -sf http://localhost:8080/api/assignments/stats
